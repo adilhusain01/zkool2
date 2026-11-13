@@ -414,6 +414,17 @@ impl Query {
             }
         }
     }
+
+    /// The txid of a signed transaction, as `signTx` returns it, in the
+    /// order `broadcastTx` answers with. It only parses the bytes: no
+    /// account, database or network, so a caller can record the txid
+    /// before posting the transaction.
+    async fn txid(tx_bytes: String) -> FieldResult<String> {
+        let tx = hex::decode(&tx_bytes)?;
+        let tx = crate::pay::broadcast::parse_transaction(&tx)
+            .ok_or(FieldError::new("Not a transaction", juniper::Value::Null))?;
+        Ok(tx.txid().to_string())
+    }
 }
 
 impl TxPlan {
@@ -822,5 +833,64 @@ mod viewing_key_tests {
         drop(context);
         drop(coin);
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod txid_tests {
+    // Requirement: `txid` gives the id the network assigns to signed bytes, in the
+    // order `broadcastTx` answers with, so a caller can record it before posting.
+    // It needs no account and touches neither the database nor the network. Bytes
+    // that are not a transaction are an error, never an id.
+    use super::Query;
+    use crate::{
+        api::coin::Coin,
+        graphql::{mutation::Mutation, Context},
+    };
+    use juniper::{EmptySubscription, InputValue, RootNode, Variables};
+
+    // A 0.001 TAZ self-send built by prepareSend and signed by signTx on testnet;
+    // testnet.zec.rocks accepted it and broadcastTx answered with TXID.
+    const TX: &str = include_str!("testdata/testnet_self_send.txt");
+    const TXID: &str = "c3189ee88b0376d48d41f789cfed0cdb2c8cbe85e6d45873811450743971f679";
+
+    async fn txid(tx_bytes: &str) -> Result<String, String> {
+        let path = format!("/tmp/graphql_txid_{}.db", uuid::Uuid::new_v4());
+        let coin = Coin::new(Some(1)).open_database(path, None).await.unwrap();
+        let context = Context::new(coin);
+        let schema = RootNode::new(Query {}, Mutation {}, EmptySubscription::<Context>::new());
+        let mut variables = Variables::new();
+        variables.insert(
+            "tx".to_owned(),
+            InputValue::scalar(tx_bytes.trim().to_owned()),
+        );
+        let (value, errors) = juniper::execute(
+            "query($tx: String!) { txid(txBytes: $tx) }",
+            None,
+            &schema,
+            &variables,
+            &context,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Some(error) = errors.first() {
+            return Err(error.error().message().to_owned());
+        }
+        Ok(serde_json::to_value(value).unwrap()["txid"]
+            .as_str()
+            .unwrap()
+            .to_owned())
+    }
+
+    #[tokio::test]
+    async fn txid_of_signed_bytes_is_the_one_the_network_gives() {
+        assert_eq!(txid(TX).await.unwrap(), TXID);
+    }
+
+    #[tokio::test]
+    async fn txid_refuses_bytes_that_are_not_a_transaction() {
+        assert!(txid("zz").await.is_err());
+        assert!(txid("00").await.is_err());
+        assert!(txid(&TX[..TX.len() / 2]).await.is_err());
     }
 }
